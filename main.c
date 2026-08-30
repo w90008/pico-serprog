@@ -5,7 +5,7 @@
  * Licensed under GPLv3
  *
  * Also based on stm32-vserprog:
- *  https://github.com/dword1511/stm32-vserprog
+ *  https://github.com
  * 
  */
 
@@ -18,7 +18,7 @@
 #define CDC_ITF     0           // USB CDC interface no
 
 #define SPI_IF      spi0        // Which PL022 to use
-#define SPI_BAUD    10000000    // Default baudrate (4 MHz - SPI default)
+#define SPI_BAUD    10000000    // Default & Maximum stable baudrate (10 MHz)
 #define SPI_CS      5
 #define SPI_MISO    4
 #define SPI_MOSI    3
@@ -87,7 +87,7 @@ static inline void readbytes_blocking(void *b, uint32_t len)
     while (len) {
         wait_for_read();
         uint32_t r = tud_cdc_n_read(CDC_ITF, b, len);
-        b += r;
+        b += (uintptr_t)r;
         len -= r;
     }
 }
@@ -110,9 +110,8 @@ static void wait_for_write(void)
 static inline void sendbytes_blocking(const void *b, uint32_t len)
 {
     while (len) {
-        // wait_for_write();
         uint32_t w = tud_cdc_n_write(CDC_ITF, b, len);
-        b += w;
+        b = (const void *)((uintptr_t)b + w);
         len -= w;
     }
 }
@@ -125,7 +124,8 @@ static inline void sendbyte_blocking(uint8_t b)
 
 static void command_loop(void)
 {
-    uint baud = spi_get_baudrate(SPI_IF);
+    uint baud = SPI_BAUD;
+    enable_spi(baud);
 
     for (;;) {
         switch (readbyte_blocking()) {
@@ -141,12 +141,9 @@ static void command_loop(void)
         case S_CMD_Q_WRNMAXLEN:
             {
                 sendbyte_blocking(S_ACK);
-
-                // Break down MAX_BUFFER_SIZE into three bytes (24 bits) in little-endian format
                 sendbyte_blocking(MAX_BUFFER_SIZE & 0xFF);         // LSB
                 sendbyte_blocking((MAX_BUFFER_SIZE >> 8) & 0xFF);  // Middle byte
                 sendbyte_blocking((MAX_BUFFER_SIZE >> 16) & 0xFF); // MSB
-
                 break;
             }
         case S_CMD_Q_CMDMAP:
@@ -177,7 +174,6 @@ static void command_loop(void)
         case S_CMD_Q_PGMNAME:
             {
                 static const char progname[16] = "pico-serprog";
-
                 sendbyte_blocking(S_ACK);
                 sendbytes_blocking(progname, sizeof progname);
                 break;
@@ -185,12 +181,9 @@ static void command_loop(void)
         case S_CMD_Q_SERBUF:
             {
                 sendbyte_blocking(S_ACK);
-
-                // Send the buffer size as a 16-bit little-endian value
                 uint16_t bufferSizeLE = SERIAL_BUFFER_SIZE & 0xFFFF;
                 sendbyte_blocking((uint8_t)(bufferSizeLE & 0xFF));        // Lower byte
                 sendbyte_blocking((uint8_t)((bufferSizeLE >> 8) & 0xFF)); // Upper byte
-
                 break;
             }
         case S_CMD_Q_BUSTYPE:
@@ -202,7 +195,6 @@ static void command_loop(void)
             sendbyte_blocking(S_ACK);
             break;
         case S_CMD_S_BUSTYPE:
-            // If SPI is among the requsted bus types we succeed, fail otherwise
             if((uint8_t) readbyte_blocking() & (1 << 3))
                 sendbyte_blocking(S_ACK);
             else
@@ -210,170 +202,59 @@ static void command_loop(void)
             break;
         case S_CMD_O_SPIOP:
             {
-                uint32_t slen, rlen;
+                uint32_t slen = 0, rlen = 0;
                 readbytes_blocking(&slen, 3); // Read send length
                 readbytes_blocking(&rlen, 3); // Read receive length
-                slen &= 0x00FFFFFF; // Mask to use only the lower 24 bits
-                rlen &= 0x00FFFFFF; // Mask to use only the lower 24 bits
+                slen &= 0x00FFFFFF; 
+                rlen &= 0x00FFFFFF; 
 
-                uint8_t tx_buffer[MAX_BUFFER_SIZE]; // Buffer for transmit data
-                uint8_t rx_buffer[MAX_BUFFER_SIZE]; // Buffer for receive data
+                uint8_t tx_buffer[MAX_BUFFER_SIZE]; 
+                uint8_t rx_buffer[MAX_BUFFER_SIZE]; 
 
-                // Read data to be sent (if slen > 0)
                 if (slen > 0) {
                     readbytes_blocking(tx_buffer, slen);
                 }
 
-                // Perform SPI operation
                 cs_select(SPI_CS);
                 if (slen > 0) {
                     spi_write_blocking(SPI_IF, tx_buffer, slen);
                 }
                 if (rlen > 0 && rlen < MAX_BUFFER_SIZE ) {
                     spi_read_blocking(SPI_IF, 0, rx_buffer, rlen);
-                    // Send ACK followed by received data
                     sendbyte_blocking(S_ACK);
-                    if (rlen > 0) {
-                        sendbytes_blocking(rx_buffer, rlen);
-                    }
-
+                    sendbytes_blocking(rx_buffer, rlen);
                     cs_deselect(SPI_CS);
                     break;
                 }
 
-                // Send ACK after handling slen (before reading)
                 sendbyte_blocking(S_ACK);
 
-                // Handle receive operation in chunks for large rlen
                 uint32_t chunk;
                 uint8_t buf[MAX_BUFFER_SIZE];
 
                 for(uint32_t i = 0; i < rlen; i += chunk) {
                     chunk = MIN(rlen - i, (uint32_t)sizeof(buf));
                     spi_read_blocking(SPI_IF, 0, buf, chunk);
-                    // Send ACK followed by received data
                     sendbyte_blocking(S_ACK);
                     sendbytes_blocking(buf, chunk);
                 }
                 cs_deselect(SPI_CS);
                 break;
             }
-            case S_CMD_S_SPI_FREQ:
+        case S_CMD_S_SPI_FREQ:
             {
-                uint32_t want_baud;
+                uint32_t want_baud = 0;
                 readbytes_blocking(&want_baud, 4);
-                if (want_baud) {
-                    // Set frequence
-                    baud = spi_set_baudrate(SPI_IF, want_baud);
-                    // Send back actual value
-                    sendbyte_blocking(S_ACK);
-                    sendbytes_blocking(&baud, 4);
+                
+                // تحديد سقف السرعة لضمان استقرار الاتصال ومنع الانهيار
+                if (want_baud > SPI_BAUD || want_baud == 0) {
+                    baud = SPI_BAUD;
                 } else {
-                    // 0 Hz is reserved
-                    sendbyte_blocking(S_NAK);
+                    baud = want_baud;
                 }
-                break;
-            }
-        case S_CMD_R_BYTE:
-            {
-                uint32_t addr;
-                readbytes_blocking(&addr, 3);
-                uint8_t data;
-
-                cs_select(SPI_CS);
-                spi_write_blocking(SPI_IF, (uint8_t*)&addr, 3); // Send address
-                spi_read_blocking(SPI_IF, 0, &data, 1); // Read one byte
-                cs_deselect(SPI_CS);
-
-                sendbyte_blocking(S_ACK);
-                sendbyte_blocking(data);
-                break;
-            }
-        case S_CMD_R_NBYTES:
-            {
-                uint32_t addr, len;
-                readbytes_blocking(&addr, 3);
-                readbytes_blocking(&len, 3);
-
-                uint8_t buffer[MAX_BUFFER_SIZE]; // Define MAX_BUFFER_SIZE based on your hardware capability
-
-                cs_select(SPI_CS);
-                spi_write_blocking(SPI_IF, (uint8_t*)&addr, 3); // Send address
-
-                while (len > 0) {
-                    uint32_t chunk_size = (len < MAX_BUFFER_SIZE) ? len : MAX_BUFFER_SIZE;
-                    spi_read_blocking(SPI_IF, 0, buffer, chunk_size);
-                    sendbytes_blocking(buffer, chunk_size);
-                    len -= chunk_size;
-                }
-
-                cs_deselect(SPI_CS);
-
-                sendbyte_blocking(S_ACK);
-                break;
-            }
-        case S_CMD_O_WRITEB:
-            {
-                if (opbuf_pos + 5 > MAX_OPBUF_SIZE) {
-                    sendbyte_blocking(S_NAK);
-                    break;
-                }
-
-                uint32_t addr;
-                uint8_t byte;
-                readbytes_blocking(&addr, 3);
-                byte = readbyte_blocking();
-
-                // Store in operation buffer (assuming format: 1-byte command, 3-byte address, 1-byte data)
-                opbuf[opbuf_pos++] = S_CMD_O_WRITEB;
-                memcpy(&opbuf[opbuf_pos], &addr, 3);
-                opbuf_pos += 3;
-                opbuf[opbuf_pos++] = byte;
-
-                sendbyte_blocking(S_ACK);
-                break;
-            }
-        case S_CMD_O_INIT:
-            {
-                opbuf_pos = 0; // Reset the operation buffer position
-                memset(opbuf, 0, MAX_OPBUF_SIZE); // Clear the buffer (optional)
-                sendbyte_blocking(S_ACK);
-                break;
-            }
-        case S_CMD_O_EXEC:
-            {
-                if (opbuf_pos == 0) {
-                    sendbyte_blocking(S_NAK);
-                    break;
-                }
-
-                // Send ACK before handling the operation buffer
-                sendbyte_blocking(S_ACK);
-
-                // Handle the operation buffer
-                uint32_t i = 0;
-                while (i < opbuf_pos) {
-                    uint8_t cmd = opbuf[i++];
-                    uint32_t addr;
-                    uint8_t byte;
-
-                    switch (cmd) {
-                    case S_CMD_O_WRITEB:
-                        memcpy(&addr, &opbuf[i], 3);
-                        i += 3;
-                        byte = opbuf[i++];
-                        cs_select(SPI_CS);
-                        spi_write_blocking(SPI_IF, (uint8_t*)&addr, 3); // Send address
-                        spi_write_blocking(SPI_IF, &byte, 1); // Send data
-                        cs_deselect(SPI_CS);
-                        break;
-                    default:
-                        sendbyte_blocking(S_NAK);
-                        break;
-                    }
-                }
-
-                // Send ACK after handling the operation buffer
+                
+                disable_spi();
+                enable_spi(baud);
                 sendbyte_blocking(S_ACK);
                 break;
             }
@@ -381,17 +262,20 @@ static void command_loop(void)
             sendbyte_blocking(S_NAK);
             break;
         }
-
-        tud_cdc_n_write_flush(CDC_ITF);
     }
 }
 
-int main()
+int main(void)
 {
-    // Setup USB
+    stdio_init_all();
     tusb_init();
-    // Setup PL022 SPI
-    enable_spi(SPI_BAUD);
 
-    command_loop();
+    while (1) {
+        tud_task();
+        if (tud_cdc_n_connected(CDC_ITF)) {
+            command_loop();
+        }
+    }
+
+    return 0;
 }
