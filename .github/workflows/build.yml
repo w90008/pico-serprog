@@ -7,11 +7,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
+    - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Build Pico Firmware
-      uses: SomethingWithComputers/pico-build-action@v1
+    # استخدام الأداة البديلة والمحدثة لبناء الكود
+    - name: Build-pico
+      uses: elehobica/build-pico@v1
       with:
         platform: 'rp2040'
         board: 'pico'
