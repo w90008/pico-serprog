@@ -84,10 +84,11 @@ static void wait_for_read(void)
 
 static inline void readbytes_blocking(void *b, uint32_t len)
 {
+    uint8_t *ptr = (uint8_t *)b;
     while (len) {
         wait_for_read();
-        uint32_t r = tud_cdc_n_read(CDC_ITF, b, len);
-        b += (uintptr_t)r;
+        uint32_t r = tud_cdc_n_read(CDC_ITF, ptr, len);
+        ptr += r;
         len -= r;
     }
 }
@@ -109,9 +110,10 @@ static void wait_for_write(void)
 
 static inline void sendbytes_blocking(const void *b, uint32_t len)
 {
+    const uint8_t *ptr = (const uint8_t *)b;
     while (len) {
-        uint32_t w = tud_cdc_n_write(CDC_ITF, b, len);
-        b = (const void *)((uintptr_t)b + w);
+        uint32_t w = tud_cdc_n_write(CDC_ITF, ptr, len);
+        ptr += w;
         len -= w;
     }
 }
@@ -164,18 +166,19 @@ static void command_loop(void)
                       (1 << S_CMD_R_BYTE)|
                       (1 << S_CMD_O_WRITEB)|
                       (1 << S_CMD_O_INIT)|
-                      (1 << S_CMD_O_EXEC)
+                      (1 << S_CMD_O_EXEC),
+                      0, 0, 0, 0, 0, 0, 0
                 };
 
                 sendbyte_blocking(S_ACK);
-                sendbytes_blocking((uint8_t *) cmdmap, sizeof cmdmap);
+                sendbytes_blocking((uint8_t *)cmdmap, sizeof(cmdmap));
                 break;
             }
         case S_CMD_Q_PGMNAME:
             {
                 static const char progname[16] = "pico-serprog";
                 sendbyte_blocking(S_ACK);
-                sendbytes_blocking(progname, sizeof progname);
+                sendbytes_blocking(progname, sizeof(progname));
                 break;
             }
         case S_CMD_Q_SERBUF:
@@ -246,7 +249,6 @@ static void command_loop(void)
                 uint32_t want_baud = 0;
                 readbytes_blocking(&want_baud, 4);
                 
-                // تحديد سقف السرعة لضمان استقرار الاتصال ومنع الانهيار
                 if (want_baud > SPI_BAUD || want_baud == 0) {
                     baud = SPI_BAUD;
                 } else {
