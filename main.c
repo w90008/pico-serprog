@@ -9,133 +9,27 @@
  * 
  */
 
-#include <stdbool.h>
-#include <string.h>
-
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include "hardware/spi.h"
 #include "tusb.h"
 #include "serprog.h"
 
-#if defined(PICO_CYW43_SUPPORTED) && PICO_CYW43_SUPPORTED
-#include "pico/cyw43_arch.h"
-#endif
-
 #define CDC_ITF     0           // USB CDC interface no
 
 #define SPI_IF      spi0        // Which PL022 to use
-#define SPI_BAUD    10000000    // Default baudrate (10 MHz)
+#define SPI_BAUD    10000000    // Default baudrate (4 MHz - SPI default)
 #define SPI_CS      5
 #define SPI_MISO    4
 #define SPI_MOSI    3
 #define SPI_SCK     2
-#define MAX_BUFFER_SIZE 256
+#define MAX_BUFFER_SIZE 4096
 #define MAX_OPBUF_SIZE 64
 #define SERIAL_BUFFER_SIZE 64
-#define LED_ACTIVITY_WINDOW_MS 200
-#define LED_ACTIVITY_HOLD_MS 700
-#define LED_BLINK_SLOW_MS 450
-#define LED_BLINK_FAST_MS 45
-#define LED_ACTIVITY_MAX_BPS 262144
 
 // Define a global operation buffer and a pointer to track the current position
 uint8_t opbuf[MAX_OPBUF_SIZE];
 uint32_t opbuf_pos = 0;
-
-static bool led_ready = false;
-static bool led_on = true;
-static uint64_t led_window_bytes = 0;
-static uint32_t led_blink_interval_ms = LED_BLINK_SLOW_MS;
-static absolute_time_t led_activity_until;
-static absolute_time_t led_window_started_at;
-static absolute_time_t led_next_toggle;
-
-static inline void led_put(bool on)
-{
-#if defined(PICO_CYW43_SUPPORTED) && PICO_CYW43_SUPPORTED
-    if (led_ready)
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, on);
-#elif defined(PICO_DEFAULT_LED_PIN)
-    if (led_ready)
-        gpio_put(PICO_DEFAULT_LED_PIN, on);
-#else
-    (void) on;
-#endif
-}
-
-static inline void led_set(bool on)
-{
-    if (led_on == on)
-        return;
-
-    led_on = on;
-    led_put(on);
-}
-
-static void led_init(void)
-{
-#if defined(PICO_CYW43_SUPPORTED) && PICO_CYW43_SUPPORTED
-    led_ready = cyw43_arch_init() == 0;
-#elif defined(PICO_DEFAULT_LED_PIN)
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-    led_ready = true;
-#endif
-
-    led_activity_until = get_absolute_time();
-    led_window_started_at = get_absolute_time();
-    led_next_toggle = make_timeout_time_ms(LED_BLINK_SLOW_MS);
-
-    if (led_ready) {
-        led_on = false;
-        led_set(true);
-    }
-}
-
-static inline void led_note_activity(uint32_t bytes)
-{
-    led_window_bytes += bytes ? bytes : 1;
-    led_activity_until = make_timeout_time_ms(LED_ACTIVITY_HOLD_MS);
-}
-
-static inline void led_task(void)
-{
-    if (!led_ready)
-        return;
-
-    absolute_time_t now = get_absolute_time();
-    int64_t window_us = absolute_time_diff_us(led_window_started_at, now);
-
-    if (window_us >= LED_ACTIVITY_WINDOW_MS * 1000) {
-        uint32_t elapsed_ms = window_us / 1000;
-
-        if (led_window_bytes > 0 && elapsed_ms > 0) {
-            uint64_t bps = (led_window_bytes * 1000) / elapsed_ms;
-            uint64_t capped_bps = bps > LED_ACTIVITY_MAX_BPS ? LED_ACTIVITY_MAX_BPS : bps;
-            uint32_t interval_range = LED_BLINK_SLOW_MS - LED_BLINK_FAST_MS;
-
-            led_blink_interval_ms = LED_BLINK_SLOW_MS -
-                ((uint32_t)capped_bps * interval_range) / LED_ACTIVITY_MAX_BPS;
-        } else if (absolute_time_diff_us(now, led_activity_until) <= 0) {
-            led_blink_interval_ms = LED_BLINK_SLOW_MS;
-        }
-
-        led_window_bytes = 0;
-        led_window_started_at = now;
-    }
-
-    if (absolute_time_diff_us(now, led_activity_until) <= 0) {
-        led_set(true);
-        led_next_toggle = make_timeout_time_ms(led_blink_interval_ms);
-        return;
-    }
-
-    if (absolute_time_diff_us(now, led_next_toggle) <= 0) {
-        led_set(!led_on);
-        led_next_toggle = make_timeout_time_ms(led_blink_interval_ms);
-    }
-}
 
 static void enable_spi(uint baud)
 {
@@ -183,22 +77,17 @@ static inline void cs_deselect(uint cs_pin) {
 
 static void wait_for_read(void)
 {
-    do {
+    do
         tud_task();
-        led_task();
-    } while (!tud_cdc_n_available(CDC_ITF));
+    while (!tud_cdc_n_available(CDC_ITF));
 }
 
 static inline void readbytes_blocking(void *b, uint32_t len)
 {
-    uint8_t *buf = b;
-
     while (len) {
         wait_for_read();
-        uint32_t r = tud_cdc_n_read(CDC_ITF, buf, len);
-        if (r)
-            led_note_activity(r);
-        buf += r;
+        uint32_t r = tud_cdc_n_read(CDC_ITF, b, len);
+        b += r;
         len -= r;
     }
 }
@@ -207,9 +96,7 @@ static inline uint8_t readbyte_blocking(void)
 {
     wait_for_read();
     uint8_t b;
-    uint32_t r = tud_cdc_n_read(CDC_ITF, &b, 1);
-    if (r)
-        led_note_activity(r);
+    tud_cdc_n_read(CDC_ITF, &b, 1);
     return b;
 }
 
@@ -217,20 +104,15 @@ static void wait_for_write(void)
 {
     do {
         tud_task();
-        led_task();
     } while (!tud_cdc_n_write_available(CDC_ITF));
 }
 
 static inline void sendbytes_blocking(const void *b, uint32_t len)
 {
-    const uint8_t *buf = b;
-
     while (len) {
-        wait_for_write();
-        uint32_t w = tud_cdc_n_write(CDC_ITF, buf, len);
-        if (w)
-            led_note_activity(w);
-        buf += w;
+        // wait_for_write();
+        uint32_t w = tud_cdc_n_write(CDC_ITF, b, len);
+        b += w;
         len -= w;
     }
 }
@@ -238,9 +120,7 @@ static inline void sendbytes_blocking(const void *b, uint32_t len)
 static inline void sendbyte_blocking(uint8_t b)
 {
     wait_for_write();
-    uint32_t w = tud_cdc_n_write(CDC_ITF, &b, 1);
-    if (w)
-        led_note_activity(w);
+    tud_cdc_n_write(CDC_ITF, &b, 1);
 }
 
 static void command_loop(void)
@@ -263,9 +143,9 @@ static void command_loop(void)
                 sendbyte_blocking(S_ACK);
 
                 // Break down MAX_BUFFER_SIZE into three bytes (24 bits) in little-endian format
-                sendbyte_blocking(32 & 0xFF);         // LSB
-                sendbyte_blocking((32 >> 8) & 0xFF);  // Middle byte
-                sendbyte_blocking((32 >> 16) & 0xFF); // MSB
+                sendbyte_blocking(MAX_BUFFER_SIZE & 0xFF);         // LSB
+                sendbyte_blocking((MAX_BUFFER_SIZE >> 8) & 0xFF);  // Middle byte
+                sendbyte_blocking((MAX_BUFFER_SIZE >> 16) & 0xFF); // MSB
 
                 break;
             }
@@ -366,14 +246,14 @@ static void command_loop(void)
 
                 // Handle receive operation in chunks for large rlen
                 uint32_t chunk;
-                char buf[128];
+                uint8_t buf[MAX_BUFFER_SIZE];
 
                 for(uint32_t i = 0; i < rlen; i += chunk) {
-                    chunk = MIN(rlen - i, sizeof(buf));
+                    chunk = MIN(rlen - i, (uint32_t)sizeof(buf));
                     spi_read_blocking(SPI_IF, 0, buf, chunk);
                     // Send ACK followed by received data
                     sendbyte_blocking(S_ACK);
-                    sendbytes_blocking(buf, rlen);
+                    sendbytes_blocking(buf, chunk);
                 }
                 cs_deselect(SPI_CS);
                 break;
@@ -508,7 +388,6 @@ static void command_loop(void)
 
 int main()
 {
-    led_init();
     // Setup USB
     tusb_init();
     // Setup PL022 SPI
